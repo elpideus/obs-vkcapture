@@ -36,6 +36,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "utils.h"
 #include "capture.h"
+#include "game-audio.h"
+#include <pipewire/pipewire.h>
 #include "plugin-macros.h"
 
 #if HAVE_X11_XCB
@@ -68,6 +70,7 @@ enum vkcapture_import_attempt {
 typedef struct {
     int id;
     int sockfd;
+    pid_t pid;
     int activated;
     int buf_id;
     int buf_fds[4];
@@ -100,6 +103,7 @@ typedef struct {
 #endif
     bool show_cursor;
     bool allow_transparency;
+    bool capture_audio;
     bool window_match;
     bool window_exclude;
     const char *window;
@@ -108,6 +112,11 @@ typedef struct {
     int client_id;
     struct capture_texture_data tdata;
 
+    /* Capture Audio: the PipeWire capture and the process it currently follows */
+    pthread_mutex_t audio_mutex;
+    struct game_audio *audio;
+    pid_t audio_pid;
+    char audio_exe[48];
 } vkcapture_source_t;
 
 static bool server_wakeup();
@@ -319,6 +328,12 @@ static void vkcapture_source_destroy(void *data)
     destroy_texture(ctx);
     cursor_destroy(ctx);
 
+    pthread_mutex_lock(&ctx->audio_mutex);
+    game_audio_destroy(ctx->audio);
+    ctx->audio = NULL;
+    pthread_mutex_unlock(&ctx->audio_mutex);
+    pthread_mutex_destroy(&ctx->audio_mutex);
+
     bfree(ctx);
 }
 
@@ -341,6 +356,18 @@ static void vkcapture_source_update(void *data, obs_data_t *settings)
     if (!strlen(ctx->window)) {
         ctx->window = NULL;
     }
+
+    ctx->capture_audio = obs_data_get_bool(settings, "capture_audio");
+    pthread_mutex_lock(&ctx->audio_mutex);
+    if (ctx->capture_audio && !ctx->audio) {
+        ctx->audio = game_audio_create(ctx->source);
+        ctx->audio_pid = -1; // retarget on the next tick
+    } else if (!ctx->capture_audio && ctx->audio) {
+        game_audio_destroy(ctx->audio);
+        ctx->audio = NULL;
+    }
+    pthread_mutex_unlock(&ctx->audio_mutex);
+    obs_source_set_audio_active(ctx->source, ctx->capture_audio);
 }
 
 static void *vkcapture_source_create(obs_data_t *settings, obs_source_t *source)
@@ -349,6 +376,7 @@ static void *vkcapture_source_create(obs_data_t *settings, obs_source_t *source)
 
     vkcapture_source_t *ctx = bzalloc(sizeof(vkcapture_source_t));
     ctx->source = source;
+    pthread_mutex_init(&ctx->audio_mutex, NULL);
 
     vkcapture_source_update(ctx, settings);
 
@@ -549,6 +577,19 @@ static void vkcapture_source_video_tick(void *data, float seconds)
         }
     }
 
+    pthread_mutex_lock(&ctx->audio_mutex);
+    if (ctx->audio) {
+        vkcapture_client_t *client = ctx->client_id ? find_client_by_id(ctx->client_id) : NULL;
+        pid_t pid = client ? client->pid : 0;
+        const char *exe = client ? client->cdata.exe : "";
+        if (pid != ctx->audio_pid || strncmp(exe, ctx->audio_exe, sizeof(ctx->audio_exe))) {
+            game_audio_set_target(ctx->audio, pid, exe);
+            ctx->audio_pid = pid;
+            snprintf(ctx->audio_exe, sizeof(ctx->audio_exe), "%s", exe);
+        }
+    }
+    pthread_mutex_unlock(&ctx->audio_mutex);
+
     pthread_mutex_unlock(&server.mutex);
 
     UNUSED_PARAMETER(seconds);
@@ -741,6 +782,7 @@ static void vkcapture_source_get_defaults(obs_data_t *defaults)
 {
     obs_data_set_default_bool(defaults, "show_cursor", true);
     obs_data_set_default_bool(defaults, "allow_transparency", false);
+    obs_data_set_default_bool(defaults, "capture_audio", false);
 }
 
 static obs_properties_t *vkcapture_source_get_properties(void *data)
@@ -797,6 +839,7 @@ static obs_properties_t *vkcapture_source_get_properties(void *data)
     }
 
     obs_properties_add_bool(props, "allow_transparency", obs_module_text("AllowTransparency"));
+    obs_properties_add_bool(props, "capture_audio", obs_module_text("CaptureAudio"));
 
     return props;
 }
@@ -834,7 +877,7 @@ static struct obs_source_info vkcapture_input = {
     .id = "vkcapture-source",
     .type = OBS_SOURCE_TYPE_INPUT,
     .get_name = vkcapture_source_get_name,
-    .output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_DO_NOT_DUPLICATE | OBS_SOURCE_SRGB,
+    .output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_DO_NOT_DUPLICATE | OBS_SOURCE_SRGB,
     .create = vkcapture_source_create,
     .destroy = vkcapture_source_destroy,
     .update = vkcapture_source_update,
@@ -964,15 +1007,16 @@ static void *server_thread_run(void *data)
                 memset(&client.buf_fds, -1, sizeof(client.buf_fds));
                 client.id = ++clientid;
                 client.sockfd = clientfd;
-                pthread_mutex_lock(&server.mutex);
-                da_push_back(server.clients, &client);
-                pthread_mutex_unlock(&server.mutex);
-                server_add_fd(client.sockfd, POLLIN);
                 struct ucred cred = {0};
                 socklen_t cred_len = sizeof(cred);
                 if (getsockopt(client.sockfd, SOL_SOCKET, SO_PEERCRED, &cred, &cred_len) != 0) {
                     blog(LOG_WARNING, "Failed to get socket credentials: %s", strerror(errno));
                 }
+                client.pid = cred.pid;
+                pthread_mutex_lock(&server.mutex);
+                da_push_back(server.clients, &client);
+                pthread_mutex_unlock(&server.mutex);
+                server_add_fd(client.sockfd, POLLIN);
                 blog(LOG_INFO, "Client %d connected (pid=%d)", client.id, cred.pid);
             } else {
                 if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ECONNABORTED) {
@@ -1105,8 +1149,9 @@ bool obs_module_load(void)
     }
     pthread_setname_np(server.thread, PLUGIN_NAME);
 
+    pw_init(NULL, NULL);
     obs_register_source(&vkcapture_input);
-    blog(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
+    blog(LOG_INFO, "plugin loaded successfully (version %s, with Capture Audio)", PLUGIN_VERSION);
 
     return true;
 }
@@ -1118,6 +1163,7 @@ void obs_module_unload()
         pthread_join(server.thread, NULL);
     }
 
+    pw_deinit();
     blog(LOG_INFO, "plugin unloaded");
 }
 

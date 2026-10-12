@@ -2,6 +2,14 @@
 
 OBS plugin for Vulkan/OpenGL game capture on Linux.
 
+> **This fork** ([elpideus/obs-vkcapture](https://github.com/elpideus/obs-vkcapture), branch `capture-audio`)
+> adds a **Capture Audio** option to the Game Capture source, like the Windows one: it records the
+> PipeWire audio of the hooked game process and outputs it as the source's own audio. Streams are
+> matched by the PID the game connects with (works for native, Steam and Proton games), falling back
+> to the executable name. Tags are `v<upstream version>-audio<N>`. Arch package:
+> `obs-vkcapture-audio` from [elpideus/obs-studio-youtube](https://github.com/elpideus/obs-studio-youtube).
+> Extra build dependency: libpipewire-0.3.
+
 AUR: [obs-vkcapture-git](https://aur.archlinux.org/packages/obs-vkcapture-git/)
 
 **Flatpak:**
@@ -25,6 +33,7 @@ For capturing games outside Flatpak runtime, you need native build regardless of
 * libxcb (optional)
 * libwayland-client (optional)
 * wayland-scanner (optional)
+* libpipewire-0.3 (this fork: Capture Audio)
 
 ## Building
 
